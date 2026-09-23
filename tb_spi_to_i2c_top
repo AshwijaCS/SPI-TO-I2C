@@ -1,0 +1,208 @@
+`timescale 1ns/1ps
+
+module tb_spi_to_i2c_top();
+    reg clk_50mhz;
+    reg rst_n_async;
+    reg host_tx_req;
+    
+    wire spi_mosi, spi_sclk, spi_cs_n;
+    reg  spi_miso;
+    
+    wire i2c_sda, i2c_scl;
+    reg  scl_master, sda_master_val, sda_master_en;
+    
+    wire fifo_full, fifo_empty, parser_error;
+    
+    // I2C Open-Drain Emulation
+    assign i2c_sda = (sda_master_en && sda_master_val == 0) ? 1'b0 : 1'bz;
+    assign i2c_scl = (scl_master == 0) ? 1'b0 : 1'bz;
+    pullup(i2c_sda); 
+    pullup(i2c_scl);
+
+    // DUT Instantiation (Strictly Physical Pins)
+    spi_to_i2c_top dut (
+        .clk_50mhz(clk_50mhz),
+        .rst_n_async(rst_n_async),
+        .host_tx_req(host_tx_req),
+        .spi_mosi(spi_mosi),
+        .spi_miso(spi_miso),
+        .spi_sclk(spi_sclk),
+        .spi_cs_n(spi_cs_n),
+        .i2c_sda(i2c_sda),
+        .i2c_scl(i2c_scl),
+        .fifo_full(fifo_full),
+        .fifo_empty(fifo_empty),
+        .parser_error(parser_error)
+    );
+
+    // Clock Generation
+    initial begin clk_50mhz = 0; forever #10 clk_50mhz = ~clk_50mhz; end
+
+    // ---------------------------------------------------------
+    // TESTBENCH TASKS
+    // ---------------------------------------------------------
+    task inject_miso_byte(input [7:0] data);
+        integer i;
+        begin
+            host_tx_req = 1'b1;
+            @(negedge spi_cs_n);
+            host_tx_req = 1'b0;
+            for(i=7; i>=0; i=i-1) begin
+                spi_miso = data[i];
+                @(negedge spi_sclk);
+            end
+            @(posedge spi_cs_n);
+            #1000;
+        end
+    endtask
+
+    task i2c_start;
+        begin sda_master_en = 0; #2500; scl_master = 1; #5000; sda_master_val = 0; sda_master_en = 1; #5000; scl_master = 0; #5000; end
+    endtask
+
+    task i2c_stop;
+        begin sda_master_val = 0; sda_master_en = 1; #2500; scl_master = 1; #5000; sda_master_en = 0; #5000; end
+    endtask
+
+    task i2c_tx_byte(input [7:0] data, output ack);
+        integer i;
+        begin
+            for(i=7; i>=0; i=i-1) begin
+                sda_master_val = data[i]; sda_master_en = ~data[i];
+                #2500; scl_master = 1; wait(i2c_scl === 1'b1); #5000; scl_master = 0; #2500;
+            end
+            sda_master_en = 0; #2500; scl_master = 1; wait(i2c_scl === 1'b1);
+            ack = (i2c_sda === 1'b0) ? 0 : 1; #5000; scl_master = 0; #2500;
+        end
+    endtask
+
+    task i2c_rx_byte(input send_ack, output [7:0] data);
+        integer i;
+        begin
+            sda_master_en = 0;
+            for(i=7; i>=0; i=i-1) begin
+                #2500; scl_master = 1; wait(i2c_scl === 1'b1);
+                data[i] = (i2c_sda === 1'b0) ? 0 : 1; #5000; scl_master = 0; #2500;
+            end
+            sda_master_val = send_ack; sda_master_en = ~send_ack;
+            #2500; scl_master = 1; wait(i2c_scl === 1'b1); #5000; scl_master = 0; sda_master_en = 0; #2500;
+        end
+    endtask
+
+    // ---------------------------------------------------------
+    // UNIFIED VARIABLES
+    // ---------------------------------------------------------
+    reg fail_flag;
+    reg [7:0] actual_i2c_rd [0:2];
+    reg [7:0] read_val;
+    reg ack_bit;
+
+    `ifdef RTL_SIM
+        // Variables used ONLY in RTL simulation
+        reg [7:0] expected_pkt [0:6];
+        reg [7:0] expected_addr [0:2];
+        reg [7:0] expected_data [0:2];
+        reg [7:0] actual_spi_rx [0:6];
+        reg [7:0] actual_fifo_rd [0:6];
+        reg [7:0] actual_parser_addr [0:2];
+        reg [7:0] actual_parser_data [0:2];
+        integer spi_rx_idx, fifo_wr_idx, fifo_rd_idx, reg_wr_idx, j;
+
+        // 1. Monitor SPI RX
+        always @(posedge dut.clk_spi) begin
+            if (dut.spi_rx_valid) begin
+                if (spi_rx_idx < 7) actual_spi_rx[spi_rx_idx] = dut.spi_rx_data;
+                if (dut.spi_rx_data !== expected_pkt[spi_rx_idx]) fail_flag = 1;
+                spi_rx_idx = spi_rx_idx + 1;
+            end
+        end
+
+        // 2. Monitor FIFO Write
+        always @(posedge dut.clk_spi) begin
+            if (dut.u_async_fifo.wr_en) begin
+                if (dut.u_async_fifo.wr_data !== expected_pkt[fifo_wr_idx]) fail_flag = 1;
+                fifo_wr_idx = fifo_wr_idx + 1;
+            end
+        end
+
+        // 3. Monitor FIFO Read
+        always @(posedge clk_50mhz) begin
+            if (dut.parser_fifo_rd_en) begin
+                if (fifo_rd_idx < 7) actual_fifo_rd[fifo_rd_idx] = dut.fifo_rd_data;
+                if (dut.fifo_rd_data !== expected_pkt[fifo_rd_idx]) fail_flag = 1;
+                fifo_rd_idx = fifo_rd_idx + 1;
+            end
+        end
+
+        // 4. Monitor Parser Writes
+        always @(posedge clk_50mhz) begin
+            if (dut.parser_wr_en) begin
+                if (reg_wr_idx < 3) begin
+                    actual_parser_addr[reg_wr_idx] = dut.parser_reg_addr;
+                    actual_parser_data[reg_wr_idx] = dut.parser_wr_data;
+                end
+                if (dut.parser_reg_addr !== expected_addr[reg_wr_idx]) fail_flag = 1;
+                if (dut.parser_wr_data !== expected_data[reg_wr_idx]) fail_flag = 1;
+                reg_wr_idx = reg_wr_idx + 1;
+            end
+        end
+    `endif
+
+    // ---------------------------------------------------------
+    // MAIN STIMULUS
+    // ---------------------------------------------------------
+    initial begin
+        fail_flag = 0;
+        actual_i2c_rd[0] = 8'h00; actual_i2c_rd[1] = 8'h00; actual_i2c_rd[2] = 8'h00;
+
+        `ifdef RTL_SIM
+            expected_pkt[0] = 8'h01; expected_pkt[1] = 8'h50; expected_pkt[2] = 8'h20; 
+            expected_pkt[3] = 8'h03; expected_pkt[4] = 8'hA5; expected_pkt[5] = 8'hB6; expected_pkt[6] = 8'hC7;
+            expected_addr[0] = 8'h20; expected_addr[1] = 8'h21; expected_addr[2] = 8'h22;
+            expected_data[0] = 8'hA5; expected_data[1] = 8'hB6; expected_data[2] = 8'hC7;
+            spi_rx_idx = 0; fifo_wr_idx = 0; fifo_rd_idx = 0; reg_wr_idx = 0;
+        `endif
+
+        // 1. Reset DUT
+        host_tx_req = 0; rst_n_async = 0; spi_miso = 0; scl_master = 1; sda_master_en = 0;
+        #1000; rst_n_async = 1; #5000;
+
+        // 2. Send SPI Packet via External Pins
+        inject_miso_byte(8'h01); inject_miso_byte(8'h50); inject_miso_byte(8'h20); 
+        inject_miso_byte(8'h03); inject_miso_byte(8'hA5); inject_miso_byte(8'hB6); inject_miso_byte(8'hC7);
+        
+        #25000; // Wait for processing
+
+        // 3. Physical I2C Readback
+        i2c_start(); i2c_tx_byte(8'hA0, ack_bit); i2c_tx_byte(8'h20, ack_bit); 
+        i2c_start(); i2c_tx_byte(8'hA1, ack_bit); 
+        i2c_rx_byte(0, read_val); actual_i2c_rd[0] = read_val; if (read_val !== 8'hA5) fail_flag = 1;
+        i2c_rx_byte(0, read_val); actual_i2c_rd[1] = read_val; if (read_val !== 8'hB6) fail_flag = 1;
+        i2c_rx_byte(1, read_val); actual_i2c_rd[2] = read_val; if (read_val !== 8'hC7) fail_flag = 1;
+        i2c_stop();
+
+        // 4. Dynamic Reporting
+        $display("\n========================================");
+        `ifdef RTL_SIM
+            $display("RTL PROTOCOL VERIFICATION");
+            $display("========================================");
+            $display("INPUT PACKET:\n01 50 20 03 A5 B6 C7\n");
+            $display("SPI RX:\n%02X %02X %02X %02X %02X %02X %02X\n", actual_spi_rx[0], actual_spi_rx[1], actual_spi_rx[2], actual_spi_rx[3], actual_spi_rx[4], actual_spi_rx[5], actual_spi_rx[6]);
+            $display("FIFO:\n%02X %02X %02X %02X %02X %02X %02X\n", actual_fifo_rd[0], actual_fifo_rd[1], actual_fifo_rd[2], actual_fifo_rd[3], actual_fifo_rd[4], actual_fifo_rd[5], actual_fifo_rd[6]);
+            $display("REGISTER WRITES:");
+            for(j=0; j<reg_wr_idx; j=j+1) $display("%02X = %02X", actual_parser_addr[j], actual_parser_data[j]);
+            $display("");
+        `else
+            $display("GATE-LEVEL PROTOCOL VERIFICATION");
+            $display("========================================");
+            $display("PHYSICAL SPI INPUT (MOSI):\n01 50 20 03 A5 B6 C7\n");
+        `endif
+        
+        $display("PHYSICAL I2C OUTPUT (SDA):\nSTART\n50 + WRITE\n20\n%02X\n%02X\n%02X\nSTOP\n", actual_i2c_rd[0], actual_i2c_rd[1], actual_i2c_rd[2]);
+        $display("FINAL RESULT:");
+        if (fail_flag) $display("FAIL"); else $display("PASS");
+        $display("========================================\n");
+        
+        $finish;
+    end
+endmodule
