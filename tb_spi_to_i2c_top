@@ -6,7 +6,12 @@ module tb_spi_to_i2c_top();
     reg host_tx_req;
     
     wire spi_mosi, spi_sclk, spi_cs_n;
-    reg  spi_miso;
+    
+    // FIX: spi_miso must be a wire to connect to the DUT's inout port.
+    // We drive it using a separate tb_miso_reg.
+    wire spi_miso;
+    reg  tb_miso_reg;
+    assign spi_miso = tb_miso_reg; 
     
     wire i2c_sda, i2c_scl;
     reg  scl_master, sda_master_val, sda_master_en;
@@ -48,7 +53,7 @@ module tb_spi_to_i2c_top();
             @(negedge spi_cs_n);
             host_tx_req = 1'b0;
             for(i=7; i>=0; i=i-1) begin
-                spi_miso = data[i];
+                tb_miso_reg = data[i]; // FIX: Drive the reg, which drives the wire
                 @(negedge spi_sclk);
             end
             @(posedge spi_cs_n);
@@ -164,7 +169,7 @@ module tb_spi_to_i2c_top();
         `endif
 
         // 1. Reset DUT
-        host_tx_req = 0; rst_n_async = 0; spi_miso = 0; scl_master = 1; sda_master_en = 0;
+        host_tx_req = 0; rst_n_async = 0; tb_miso_reg = 0; scl_master = 1; sda_master_en = 0;
         #1000; rst_n_async = 1; #5000;
 
         // 2. Send SPI Packet via External Pins
