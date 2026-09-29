@@ -1,0 +1,44 @@
+$date
+	Tue Sep 29 11:49:05 2026
+$end
+$version
+	Questa Altera Starter FPGA Edition Version 2025.2
+$end
+$timescale
+	1ps
+$end
+$scope module tb_spi_to_i2c_topp $end
+$var wire 1 ! spi_cs_n $end
+$upscope $end
+$enddefinitions $end
+#0
+1!
+1!
+#6490000
+0!
+#9890000
+1!
+#11290000
+0!
+#14690000
+1!
+#16090000
+0!
+#19490000
+1!
+#20890000
+0!
+#24290000
+1!
+#25690000
+0!
+#29090000
+1!
+#30490000
+0!
+#33890000
+1!
+#35290000
+0!
+#38690000
+1!
