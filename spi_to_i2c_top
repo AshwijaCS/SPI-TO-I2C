@@ -5,49 +5,27 @@ module spi_to_i2c_top (
     input  wire rst_n_async,
     input  wire host_tx_req,
     
-    // Bidirectional SPI physical pins
-    inout  wire spi_mosi,
-    inout  wire spi_miso,
-    inout  wire spi_sclk,
-    inout  wire spi_cs_n,
+    // Explicit SPI Master physical pins
+    output wire spi_mosi,
+    input  wire spi_miso,
+    output wire spi_sclk,
+    output wire spi_cs_n,
     
     // Bidirectional I2C physical pins
     inout  wire i2c_sda,
     inout  wire i2c_scl,
     
+    // Status Flags
     output wire fifo_full,
     output wire fifo_empty,
     output wire parser_error
 );
 
     // ----------------------------------------------------
-    // 1. TRI-STATE SPI I/O BUFFER LOGIC
+    // 1. CLOCK AND RESET GENERATION
     // ----------------------------------------------------
-    wire internal_mosi, internal_sclk, internal_cs_n, internal_miso;
-    
-    // Output Enable (OE) controls for SPI Master mode
-    wire spi_mosi_oe = 1'b1; // Master actively drives MOSI
-    wire spi_sclk_oe = 1'b1; // Master actively drives SCLK
-    wire spi_cs_n_oe = 1'b1; // Master actively drives CS_N
-    wire spi_miso_oe = 1'b0; // Master NEVER drives MISO (listens only)
-
-    // Physical pin assignments using ternary operators (infers hardware IOBUF)
-    assign spi_mosi = spi_mosi_oe ? internal_mosi : 1'bz;
-    assign spi_sclk = spi_sclk_oe ? internal_sclk : 1'bz;
-    assign spi_cs_n = spi_cs_n_oe ? internal_cs_n : 1'bz;
-    assign spi_miso = spi_miso_oe ? 1'b0          : 1'bz; 
-    
-    // Internal read-back from the physical MISO pin
-    assign internal_miso = spi_miso; 
-
-
-    // ----------------------------------------------------
-    // 2. CLOCK AND RESET GENERATION
-    // ----------------------------------------------------
-    wire clk_sys, clk_spi;
-    
-    // Assign the 50MHz system clock directly since clock_gen only divides
-    assign clk_sys = clk_50mhz; 
+    wire clk_sys = clk_50mhz; 
+    wire clk_spi;
     
     clock_gen u_clk_gen (
         .clk_50mhz   (clk_50mhz),
@@ -69,9 +47,26 @@ module spi_to_i2c_top (
         .rst_n_out (rst_n_spi)
     );
 
+    // ----------------------------------------------------
+    // 2. EDGE DETECTOR FOR ESP32 TRIGGER
+    // (Prevents double-firing the SPI Master)
+    // ----------------------------------------------------
+    reg host_req_meta, host_req_sync, host_req_prev;
+    always @(posedge clk_spi or negedge rst_n_spi) begin
+        if (!rst_n_spi) begin
+            host_req_meta <= 1'b0; 
+            host_req_sync <= 1'b0; 
+            host_req_prev <= 1'b0;
+        end else begin
+            host_req_meta <= host_tx_req;
+            host_req_sync <= host_req_meta;
+            host_req_prev <= host_req_sync;
+        end
+    end
+    wire host_tx_req_pulse = host_req_sync & ~host_req_prev;
 
     // ----------------------------------------------------
-    // 3. SPI INGRESS (MASTER RECEIVING FROM EXTERNAL SLAVE)
+    // 3. SPI INGRESS (MASTER RECEIVING FROM ESP32)
     // ----------------------------------------------------
     wire spi_rx_valid;
     wire [7:0] spi_rx_data;
@@ -80,21 +75,21 @@ module spi_to_i2c_top (
     spi_master u_spi_master (
         .clk_spi  (clk_spi),
         .rst_n    (rst_n_spi),
-        .tx_data  (8'h00),         // Tied to 0; our focus is receiving MISO
-        .tx_valid (host_tx_req),
+        .tx_data  (8'h00),             // Dummy byte; focus is reading MISO
+        .tx_valid (host_tx_req_pulse), // Only trigger once per rising edge
         .tx_ready (spi_tx_ready),
         .rx_data  (spi_rx_data),
         .rx_valid (spi_rx_valid),
         .busy     (spi_busy),
-        .spi_mosi (internal_mosi),
-        .spi_miso (internal_miso),
-        .spi_sclk (internal_sclk),
-        .spi_cs_n (internal_cs_n)
+        
+        .spi_mosi (spi_mosi),
+        .spi_miso (spi_miso),
+        .spi_sclk (spi_sclk),
+        .spi_cs_n (spi_cs_n)
     );
 
-
     // ----------------------------------------------------
-    // 4. CLOCK DOMAIN CROSSING (FIFO)
+    // 4. CLOCK DOMAIN CROSSING (ASYNCHRONOUS FIFO)
     // ----------------------------------------------------
     wire parser_fifo_rd_en;
     wire [7:0] fifo_rd_data;
@@ -114,7 +109,6 @@ module spi_to_i2c_top (
         .empty    (fifo_empty)
     );
 
-
     // ----------------------------------------------------
     // 5. PACKET PARSING (FSM)
     // ----------------------------------------------------
@@ -126,7 +120,8 @@ module spi_to_i2c_top (
     wire [7:0] length;
     
     wire slave_busy;
-    wire ack_error;
+    wire i2c_ack_error;
+    wire [7:0] i2c_rd_data;
 
     packet_parser u_packet_parser (
         .clk_sys    (clk_sys),
@@ -136,8 +131,8 @@ module spi_to_i2c_top (
         .fifo_empty (fifo_empty),
         .fifo_rd_en (parser_fifo_rd_en),
         
-        .rd_data    (8'h00), // Hardcoded for this uni-directional test flow
-        .busy       (slave_busy),
+        .rd_data    (i2c_rd_data),     // Links data read back from I2C Slave
+        .busy       (slave_busy),      // Halts parser if I2C slave is actively processing
         
         .i2c_addr   (i2c_addr),
         .reg_addr   (reg_addr),
@@ -148,12 +143,9 @@ module spi_to_i2c_top (
         .ack_error  (parser_error) 
     );
 
-
     // ----------------------------------------------------
     // 6. I2C EGRESS (SLAVE MEMORY TO EXTERNAL PINS)
     // ----------------------------------------------------
-    wire [7:0] i2c_rd_data;
-
     i2c_slave u_i2c_slave (
         .clk_sys    (clk_sys),
         .rst_n      (rst_n_sys),
@@ -168,7 +160,7 @@ module spi_to_i2c_top (
         .rd_data    (i2c_rd_data),
         
         .slave_busy (slave_busy),
-        .ack_error  (ack_error)
+        .ack_error  (i2c_ack_error)
     );
 
 endmodule
